@@ -53,6 +53,8 @@
 #include "tcop/tcopprot.h"
 #include "utils/datum.h"
 #include "utils/memutils.h"
+#include "fmgr.h"
+#include "halfvec.h"
 
 #if PG_VERSION_NUM >= 140000
 #include "utils/backend_progress.h"
@@ -1050,6 +1052,80 @@ ComputeParallelWorkers(Relation heap, Relation index)
 	return max_parallel_maintenance_workers;
 }
 
+static double
+HnswMemoryBytesPerElementExcludingValue(int m, double ml) {
+	double geometricP = 1 - exp(-1 / ml);
+
+	/*
+	 * Average level of a node. We subtract 1 because we number levels starting
+	 * from 0. On average, a node is present at (avgLevel + 1) levels.
+	 */
+	double avgLevel = 1 / geometricP - 1;
+
+	/*
+	 * For each element we store:
+	 * - HnswElementData struct
+	 * - An array of pointers to neighbor arrays, as many as the number of
+	 *   levels where the element is present.
+	 * - The neighbor arrays themselves. We need to take into account that the
+	 *   lowest level has a different number of neighbors per node than higher
+	 *   levels. But it also helps that every node is present at the lowest
+	 *   level.
+	 */
+	return MAXALIGN(sizeof(HnswElementData)) +
+		(avgLevel + 1) * sizeof(HnswNeighborArrayPtr) +
+		(
+			MAXALIGN(HNSW_NEIGHBOR_ARRAY_SIZE(HnswGetLayerM(m, 0))) +
+			avgLevel * MAXALIGN(HNSW_NEIGHBOR_ARRAY_SIZE(m))
+		);
+}
+
+/*
+ * Returns the number of bytes used by a single element on average, excluding
+ * the vector value itself. The vector value size depends on the vector data
+ * type and the number of dimensions.
+ */
+static double
+HnswMemoryBytesPerElementExcludingValueForM(int m)
+{
+	return HnswMemoryBytesPerElementExcludingValue(m, HnswGetMl(m));
+}
+
+/*
+ * Validate our memory usage estimation formula to ensure that users have a
+ * good way to provision sufficient memory for an HNSW build. This assumes that
+ * the graph was built fully in memory.
+ */
+static void ValidateMemoryUsageEstimation(HnswBuildState * buildstate)
+{
+	HnswGraph * graph = buildstate->graph;
+	Size actualMemoryUsage = graph->memoryUsed;
+	double numTuples = graph->indtuples;
+	if (numTuples < 1) {
+		return;
+	}
+	double actualMemoryUsagePerTuple = actualMemoryUsage / numTuples;
+
+	/* TODO: use the actual vector size, do not assume float vectors. */
+	double estimatedMemoryUsagePerTuple =
+		HnswMemoryBytesPerElementExcludingValue(buildstate->m, buildstate->ml) +
+		VECTOR_SIZE(buildstate->dimensions);
+
+	double estimationError =
+		(estimatedMemoryUsagePerTuple - actualMemoryUsagePerTuple) /
+		actualMemoryUsagePerTuple;
+	elog(
+		NOTICE,
+		"Tuples indexed in memory: %.0f, "
+		"bytes used per tuple: %.3f, "
+		"estimated bytes per tuple: %.3f, "
+		"estimation error: %.6f%%",
+		numTuples,
+		actualMemoryUsagePerTuple,
+		estimatedMemoryUsagePerTuple,
+		estimationError * 100);
+}
+
 /*
  * Build graph
  */
@@ -1082,7 +1158,10 @@ BuildGraph(HnswBuildState * buildstate, ForkNumber forkNum)
 
 	/* Flush pages */
 	if (!buildstate->graph->flushed)
+	{
 		FlushPages(buildstate);
+		ValidateMemoryUsageEstimation(buildstate);
+	}
 
 	/* End parallel build */
 	if (buildstate->hnswleader)
@@ -1138,4 +1217,26 @@ hnswbuildempty(Relation index)
 	HnswBuildState buildstate;
 
 	BuildIndex(NULL, index, indexInfo, &buildstate, INIT_FORKNUM);
+}
+
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(hnsw_build_memory_bytes_per_vector);
+Datum
+hnsw_build_memory_bytes_per_vector(PG_FUNCTION_ARGS)
+{
+	int dimensions = PG_GETARG_INT32(0);
+	int m = PG_GETARG_INT32(1);
+
+	PG_RETURN_FLOAT8(HnswMemoryBytesPerElementExcludingValueForM(m) +
+		VECTOR_SIZE(dimensions));
+}
+
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(hnsw_build_memory_bytes_per_halfvec);
+Datum
+hnsw_build_memory_bytes_per_halfvec(PG_FUNCTION_ARGS)
+{
+	int dimensions = PG_GETARG_INT32(0);
+	int m = PG_GETARG_INT32(1);
+
+	PG_RETURN_FLOAT8(HnswMemoryBytesPerElementExcludingValueForM(m) +
+		HALFVEC_SIZE(dimensions));
 }
